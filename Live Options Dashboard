@@ -1,0 +1,279 @@
+# live_options_dashboard.py
+# See previous cell for full description and usage.
+import os, math, json, argparse, datetime as dt
+import requests
+import pandas as pd
+import numpy as np
+from math import log, sqrt, exp
+from scipy.stats import norm
+
+API = os.environ.get("POLYGON_API_KEY", "").strip()
+BASE = "https://api.polygon.io"
+
+def http_get(path, params=None):
+    if params is None: params = {}
+    params["apiKey"] = API
+    r = requests.get(BASE + path, params=params, timeout=15)
+    r.raise_for_status()
+    return r.json()
+
+def rsi(series, period=14):
+    s = pd.Series(series).astype(float)
+    delta = s.diff()
+    up = np.where(delta > 0, delta, 0.0)
+    down = np.where(delta < 0, -delta, 0.0)
+    roll_up = pd.Series(up).rolling(period).mean()
+    roll_down = pd.Series(down).rolling(period).mean()
+    rs = roll_up / (roll_down + 1e-9)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    return float(rsi.iloc[-1])
+
+def sma(series, n):
+    s = pd.Series(series).astype(float)
+    return float(s.rolling(n).mean().iloc[-1])
+
+def bs_call_iv(price, S, K, T, r=0.045):
+    if price <= 0 or S <= 0 or K <= 0 or T <= 0:
+        return np.nan
+    low, high = 1e-4, 5.0
+    for _ in range(60):
+        mid = 0.5*(low+high)
+        d1 = (math.log(S/K)+(r+0.5*mid*mid)*T)/(mid*math.sqrt(T))
+        d2 = d1 - mid*math.sqrt(T)
+        calc = S*norm.cdf(d1) - K*math.exp(-r*T)*norm.cdf(d2)
+        if calc > price: high = mid
+        else: low = mid
+    return 0.5*(low+high)
+
+def bs_call_delta(S, K, T, r, sigma):
+    if any(x<=0 for x in [S,K,T,sigma]): return np.nan
+    d1 = (math.log(S/K)+(r+0.5*sigma**2)*T)/(sigma*math.sqrt(T))
+    return float(norm.cdf(d1))
+
+def choose_optimal_range(mark):
+    if mark is None or mark <= 0: return (0.0, 0.0, 0.0)
+    low = round(mark*0.95, 2)
+    high = round(mark*1.00, 2)
+    absmax = round(mark*1.10, 2) if mark < 20 else round(mark*1.05, 2)
+    return (low, high, absmax)
+
+def tp_stop_from_mark(mark):
+    if not mark or mark<=0: return (0.0,0.0,0.0)
+    tp1 = round(mark*1.40, 2)
+    tp2 = round(mark*1.60, 2)
+    stop = round(mark*0.75, 2)
+    return (tp1,tp2,stop)
+
+def load_equity_snapshot(ticker):
+    today = dt.date.today()
+    start = (today - dt.timedelta(days=120)).isoformat()
+    end = today.isoformat()
+    agg = http_get(f"/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}", {"adjusted":"true","sort":"asc","limit":200})
+    if not agg.get("results"): return None
+    closes = [x["c"] for x in agg["results"]]
+    price = float(closes[-1])
+    ma20 = sma(closes, 20)
+    ma50 = sma(closes, 50)
+    r = rsi(closes, 14)
+    return {"price":price,"ma20":ma20,"ma50":ma50,"rsi":r}
+
+def pick_model_option(ticker, dte_target=(20,45), target_delta=0.40, side="CALL"):
+    out = http_get(f"/v3/reference/options/contracts", {"underlying_ticker":ticker, "limit":1000})
+    exps = sorted({c["expiration_date"] for c in out.get("results",[]) if c.get("expiration_date")})
+    if not exps: return None
+    today = dt.date.today()
+    candidates = []
+    for e in exps:
+        try:
+            dte = (dt.datetime.fromisoformat(e).date() - today).days
+        except:
+            continue
+        if dte_target[0] <= dte <= dte_target[1]:
+            candidates.append((e,dte))
+    if not candidates:
+        exps_d = [(e, abs((dt.datetime.fromisoformat(e).date() - today).days - np.mean(dte_target))) for e in exps]
+        e = min(exps_d, key=lambda x:x[1])[0]
+        candidates = [(e,(dt.datetime.fromisoformat(e).date() - today).days)]
+    e = candidates[0][0]
+    snap = http_get(f"/v3/snapshot/options/{ticker}", {"expiration_date":e, "limit":500})
+    res = snap.get("results", [])
+    if not res: return None
+    today = dt.date.today()
+    T = max((dt.datetime.fromisoformat(e).date() - today).days,1)/365.0
+    best_row, best_diff = None, 1e9
+    for r in res:
+        if side=="CALL" and r.get("details",{}).get("contract_type")!="call": continue
+        if side=="PUT" and r.get("details",{}).get("contract_type")!="put": continue
+        sd = r.get("details",{})
+        q = r.get("last_quote",{})
+        bid = q.get("bid",0) or 0.0
+        ask = q.get("ask",0) or 0.0
+        if bid<=0 or ask<=0: continue
+        mark = 0.5*(bid+ask)
+        K = float(sd.get("strike_price",0))
+        iv = r.get("greeks",{}).get("iv")
+        S = r.get("underlying_asset",{}).get("price")
+        if not S:
+            eq = load_equity_snapshot(ticker)
+            S = eq["price"] if eq else None
+        if not S or S<=0: continue
+        if not iv or iv<=0:
+            iv = bs_call_iv(mark, S, K, T, r=0.045) if side=="CALL" else bs_call_iv(mark, S, K, T, r=0.045)
+        delta = r.get("greeks",{}).get("delta")
+        if delta is None or abs(delta)<=0 or abs(delta)>1:
+            delta = bs_call_delta(S, K, T, 0.045, iv) if side=="CALL" else (bs_call_delta(S, K, T, 0.045, iv)-1.0)
+        oi = r.get("open_interest",0) or 0
+        spread = ask - bid
+        if oi < 300 or spread > max(0.10, 0.05*mark):
+            continue
+        d = abs(abs(delta) - target_delta)
+        if d < best_diff:
+            best_diff = d
+            best_row = {
+                "ticker": ticker,
+                "expiry": e,
+                "strike": K,
+                "side": side,
+                "bid": round(bid,2),
+                "ask": round(ask,2),
+                "mark": round(mark,2),
+                "iv": round(iv*100.0,2) if iv==iv else None,
+                "delta": round(float(abs(delta)),2) if delta==delta else None,
+                "oi": int(oi),
+                "spread": round(spread,2),
+                "S": float(S),
+                "T_days": int(T*365)
+            }
+    return best_row
+
+def choose_optimal_range(mark):
+    if mark is None or mark <= 0: return (0.0, 0.0, 0.0)
+    low = round(mark*0.95, 2)
+    high = round(mark*1.00, 2)
+    absmax = round(mark*1.10, 2) if mark < 20 else round(mark*1.05, 2)
+    return (low, high, absmax)
+
+def tp_stop_from_mark(mark):
+    if not mark or mark<=0: return (0.0,0.0,0.0)
+    tp1 = round(mark*1.40, 2)
+    tp2 = round(mark*1.60, 2)
+    stop = round(mark*0.75, 2)
+    return (tp1,tp2,stop)
+
+def make_plan_line(opt, confidence=7):
+    if not opt: return None
+    low, high, absmax = choose_optimal_range(opt["mark"])
+    tp1,tp2,stop = tp_stop_from_mark(opt["mark"])
+    plan = {
+        "header": f"{opt['ticker']} {opt['side']} | {int(opt['strike'])} {opt['expiry']}",
+        "buy_range": f"Buy {low:.2f}-{high:.2f} (max {absmax:.2f})",
+        "tp_stop": f"TP1 {tp1:.2f} | TP2 {tp2:.2f} | Stop {stop:.2f}",
+        "greeks": f"Δ {opt.get('delta','?')} | IV {opt.get('iv','?')}% | OI {opt.get('oi','?')}",
+        "mark": opt["mark"],
+        "confidence": confidence
+    }
+    return plan
+
+def save_outputs(best, silver, watchlist, actives):
+    css = """<style>
+    body{font-family:Arial,Helvetica,sans-serif; margin:20px; color:#222}
+    .card{border:1px solid #ddd; border-radius:8px; padding:12px; margin:10px 0}
+    .hdr{font-weight:700}
+    .best{border-color:#2a9d8f;background:#f1fcfa}
+    .silver{border-color:#577590;background:#f5f8ff}
+    .row{display:flex; gap:10px; flex-wrap:wrap}
+    .pill{padding:2px 8px; border:1px solid #ccc; border-radius:999px; font-size:12px}
+    </style>"""
+    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+    html = [f"<html><head><meta charset='utf-8'>{css}</head><body>",
+            f"<h1>CHRIS MILLER-ROOT — OPTIONS DASHBOARD (LIVE • POLYGON DEMO)</h1>",
+            f"<p>Generated {now}</p>",
+            "<h2>Active Positions</h2>"]
+    for c in actives:
+        html.append("<div class='card'>" + "".join([
+            f"<div class='hdr'>{c['title']}</div>",
+            f"<div>{c['status']}</div>",
+            f"<div class='row'><span class='pill'>{c['pricing']}</span><span class='pill'>{c['greeks']}</span><span class='pill'>{c['plan']}</span></div>",
+            f"<div><b>Notes:</b> {c['notes']}</div>"
+        ]) + "</div>")
+    if best:
+        html.append("<h2>⭐ Best Trade of the Day</h2>")
+        html.append("<div class='card best'>" + "".join([
+            f"<div class='hdr'>{best['header']}</div>",
+            f"<div class='row'><span class='pill'>{best['buy_range']}</span><span class='pill'>{best['tp_stop']}</span><span class='pill'>{best['greeks']}</span></div>",
+            f"<div>Confidence: {best['confidence']}/10</div>"
+        ]) + "</div>")
+    if silver:
+        html.append("<h2>🥈 Silver Star</h2>")
+        html.append("<div class='card silver'>" + "".join([
+            f"<div class='hdr'>{silver['header']}</div>",
+            f"<div class='row'><span class='pill'>{silver['buy_range']}</span><span class='pill'>{silver['tp_stop']}</span><span class='pill'>{silver['greeks']}</span></div>",
+            f"<div>Confidence: {silver['confidence']}/10</div>"
+        ]) + "</div>")
+    html.append("<h2>Guidance / Watchlist</h2>")
+    for w in watchlist:
+        html.append("<div class='card'>" + "".join([
+            f"<div class='hdr'>{w['header']}</div>",
+            f"<div class='row'><span class='pill'>{w['buy_range']}</span><span class='pill'>{w['tp_stop']}</span><span class='pill'>{w['greeks']}</span></div>",
+            f"<div>Confidence: {w['confidence']}/10</div>"
+        ]) + "</div>")
+    html.append("</body></html>")
+    Path("CMR_Options_Report_DEMO.html").write_text("\n".join(html), encoding="utf-8")
+    notes = []
+    if best:
+        notes.append(f"BEST: {best['header']} | {best['buy_range']} | {best['tp_stop']} | {best['greeks']} | Conf {best['confidence']}/10")
+    if silver:
+        notes.append(f"SILVER: {silver['header']} | {silver['buy_range']} | {silver['tp_stop']} | {silver['greeks']} | Conf {silver['confidence']}/10")
+    notes.append("WATCHLIST:")
+    for w in watchlist:
+        notes.append(f"{w['header']} | {w['buy_range']} | {w['tp_stop']} | {w['greeks']} | Conf {w['confidence']}/10")
+    Path("CMR_Action_Notes_DEMO.txt").write_text("\n".join(notes), encoding="utf-8")
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--guidance", nargs="+", default=["AMD","NVDA","AAPL","TSLA","SPY"])
+    args = ap.parse_args()
+    # Active placeholders from your current positions
+    actives = [
+        {"title":"BITF $8C (10/17) — Exit Mgmt","status":"Premium near $0.07, Δ≈0.13, IV≈272% — expiring; avoid re-entry.","pricing":"0.06–0.08 (max 0.09)","greeks":"Δ 0.13 | Θ fast | IV 272% | OI 2,131","plan":"TP1 0.11 | TP2 0.13 | Stop 0.05","notes":"Sell into strength; consider roll only if > MA20 + volume."},
+        {"title":"WULF $19C (10/17) — Exit Mgmt","status":"Premium ~0.06, Δ≈0.07, IV≈205% — deep OTM; expiring.","pricing":"Avoid new buys; roll 10/24 $16–$17C if > 16.20 + volume.","greeks":"Δ 0.07 | Θ fast | IV 205% | OI 1,317","plan":"TP1 0.08 | TP2 0.10 | Stop 0.04","notes":"Preferred roll Δ≈0.25."},
+        {"title":"MS $175C (10/17) — Exit Now","status":"Premium ~0.04, Δ≈0.02 — far OTM; exit to salvage.","pricing":"No new entry.","greeks":"Δ 0.02 | Θ fast | IV 54% | OI 783","plan":"Exit on any pop; do not hold through expiry.","notes":"Future: consider $165C with ≥21 DTE."},
+    ]
+
+    # Build watchlist and rank
+    ranking = []
+    for t in args.guidance:
+        try:
+            eq = load_equity_snapshot(t)
+            if not eq: continue
+            side = "CALL" if eq["price"] > eq["ma20"] > eq["ma50"] else "PUT" if eq["price"] < eq["ma20"] < eq["ma50"] else "CALL"
+            opt = pick_model_option(t, dte_target=(25,45), target_delta=0.40 if side=="CALL" else 0.35, side=side)
+            if not opt: continue
+            score = 0
+            if opt.get("delta"): score += max(0, 1.0 - abs(opt["delta"] - (0.40 if side=="CALL" else 0.35)))
+            if opt.get("iv") and 20 <= opt["iv"] <= 120: score += 0.6
+            if opt.get("oi",0) >= 1000: score += 0.6
+            if opt.get("spread",0) <= max(0.10, 0.05*opt["mark"]): score += 0.4
+            rsi_val = eq["rsi"]
+            if (side=="CALL" and rsi_val>=55) or (side=="PUT" and rsi_val<=45): score += 0.6
+            ranking.append((score, t, side, opt, eq))
+        except Exception as e:
+            continue
+
+    ranking.sort(reverse=True, key=lambda x:x[0])
+    picks = ranking[:5]
+
+    watchlist = []
+    best = None
+    silver = None
+    for idx, (score, t, side, opt, eq) in enumerate(picks):
+        plan = make_plan_line(opt, confidence= round(6 + 4*min(1.0, score/3.2),1))
+        watchlist.append(plan)
+        if idx==0: best = plan
+        elif idx==1: silver = plan
+
+    save_outputs(best, silver, watchlist, actives)
+    print("Saved CMR_Options_Report_DEMO.html and CMR_Action_Notes_DEMO.txt")
+
+if __name__ == "__main__":
+    main()
